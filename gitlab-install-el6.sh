@@ -10,13 +10,15 @@
 export GL_HOSTNAME=$HOSTNAME
 
 # Install from this GitLab branch
-export GL_GIT_BRANCH="5-0-stable"
+export GL_GIT_BRANCH="6-6-stable"
 
 # Define the version of ruby the environment that we are installing for
-export RUBY_VERSION="1.9.3-p392"
+ACTUAL_RUBY_VERSION="2.1.1"
+export RUBY_VERSION=$ACTUAL_RUBY_VERSION
 
 # Define MySQL root password
 MYSQL_ROOT_PW=$(cat /dev/urandom | tr -cd [:alnum:] | head -c ${1:-16})
+MYSQL_GIT_PW=$(cat /dev/urandom | tr -cd [:alnum:] | head -c ${1:-16})
 
 # Exit on error
 
@@ -27,18 +29,34 @@ die()
 
   retcode=$1
   shift
-  printf >&2 "%s\n" "$@"
+printf >&2 "%s\n" "$@"
   exit $retcode
 }
 
 echo "### Check OS (we check if the kernel release contains el6)"
 uname -r | grep "el6" || die 1 "Not RHEL or CentOS 6 (el6)"
 
-# Install base packages
-yum -y install git
+if [ $(uname -m) == 'x86_64' ]; then
+	# 64 bit
+	# Install base packages
+	# For Gitlab 6.6 we need a fresher git - use rpmforge to get it
+	yum -y install http://packages.sw.be/rpmforge-release/rpmforge-release-0.5.2-2.el6.rf.x86_64.rpm
+	sed -i "/\[rpmforge-extras\]/,/\[rpmforge-testing\]/ s/enabled = 0/enabled = 1/" /etc/yum.repos.d/rpmforge.repo
+	yum -y install git
+	
+	## Install epel-release
+	yum -y install http://dl.fedoraproject.org/pub/epel/6/x86_64/epel-release-6-8.noarch.rpm
+else
+	# 32 bit
+        # Install base packages
+        # For Gitlab 6.6 we need a fresher git - use rpmforge to get it
+        yum -y install http://packages.sw.be/rpmforge-release/rpmforge-release-0.5.2-2.el6.rf.i686.rpm
+        sed -i "/\[rpmforge-extras\]/,/\[rpmforge-testing\]/ s/enabled = 0/enabled = 1/" /etc/yum.repos.d/rpmforge.repo
+        yum -y install git
 
-## Install epel-release
-yum -y install http://dl.fedoraproject.org/pub/epel/6/i386/epel-release-6-8.noarch.rpm
+        ## Install epel-release
+        yum -y install http://dl.fedoraproject.org/pub/epel/6/i386/epel-release-6-8.noarch.rpm
+fi
 
 # Ruby
 ## packages (from rvm install message):
@@ -49,6 +67,10 @@ curl -L get.rvm.io | bash -s stable
 
 ## Load RVM
 source /etc/profile.d/rvm.sh
+
+## Export again for the rvm-shell-environment? For some reason it looses only the ruby-version.
+# Define the version of ruby the environment that we are installing for
+export RUBY_VERSION=$ACTUAL_RUBY_VERSION
 
 ## Fix for missing psych
 ## *It seems your ruby installation is missing psych (for YAML output).
@@ -83,6 +105,14 @@ su - git -c "gitlab-shell/bin/install"
 chmod 600 /home/git/.ssh/authorized_keys
 chmod 700 /home/git/.ssh
 
+#Save MySQL Passwords
+cat > /home/git/mysql_passwords << EOF
+root	$MYSQL_ROOT_PW
+git	$MYSQL_GIT_PW
+EOF
+
+chmod 600 /home/git/mysql_passwords
+
 # Database
 
 ## Install redis
@@ -106,6 +136,9 @@ service mysqld start
 ### Create the database
 echo "CREATE DATABASE IF NOT EXISTS gitlabhq_production DEFAULT CHARACTER SET 'utf8' COLLATE 'utf8_unicode_ci';" | mysql -u root
 
+### Create User git with privileges on the Gitlab-Database
+echo "GRANT ALL PRIVILEGES ON gitlabhq_production.* TO 'git'@'localhost' IDENTIFIED BY '$MYSQL_GIT_PW';" | mysql -u root
+
 ## Set MySQL root password in MySQL
 echo "UPDATE mysql.user SET Password=PASSWORD('$MYSQL_ROOT_PW') WHERE User='root'; FLUSH PRIVILEGES;" | mysql -u root
 
@@ -125,13 +158,16 @@ cd /home/git/gitlab
 su git -c "cp config/gitlab.yml.example config/gitlab.yml"
 
 ### Change gitlabhq hostname to GL_HOSTNAME
-sed -i "s/  host: localhost/  host: $GL_HOSTNAME/g" config/gitlab.yml
+sed -i "s/ host: localhost/ host: $GL_HOSTNAME/g" config/gitlab.yml
 
 ### Change the from email address
 sed -i "s/from: gitlab@localhost/from: gitlab@$GL_HOSTNAME/g" config/gitlab.yml
 
 ### Copy the example Unicorn config
 su git -c "cp config/unicorn.rb.example config/unicorn.rb"
+
+## Fix for 502 bad proxy timeout error on first loading
+sed -i "s/timeout 30/timeout 60/g" /home/git/gitlab/config/unicorn.rb
 
 ### Listen on localhost:3000
 sed -i "s/^listen/#listen/g" /home/git/gitlab/config/unicorn.rb
@@ -141,10 +177,10 @@ sed -i "s/#listen \"127.0.0.1:8080\"/listen \"127.0.0.1:3000\"/g" /home/git/gitl
 su git -c "cp config/database.yml.mysql config/database.yml"
 
 ### Set MySQL root password in configuration file
-sed -i "s/secure password/$MYSQL_ROOT_PW/g" config/database.yml
+sed -i "s/secure password/$MYSQL_GIT_PW/g" config/database.yml
 
 ### Configure git user
-su git -c 'git config --global user.name  "GitLab"'
+su git -c 'git config --global user.name "GitLab"'
 su git -c 'git config --global user.email "gitlab@$GL_HOSTNAME"'
 
 # Install Gems
@@ -163,13 +199,14 @@ export force=yes
 su git -c "bundle exec rake gitlab:setup RAILS_ENV=production"
 
 ## Install init script
-curl --output /etc/init.d/gitlab https://raw.github.com/gitlabhq/gitlab-recipes/master/init/sysvinit/centos/gitlab-unicorn
+curl --output /etc/init.d/gitlab https://gitlab.com/gitlab-org/gitlab-recipes/raw/master/init/sysvinit/centos/gitlab-unicorn
+#curl --output /etc/init.d/gitlab https://raw.github.com/gitlabhq/gitlab-recipes/master/init/sysvinit/centos/gitlab-unicorn
 chmod +x /etc/init.d/gitlab
 
 ## Fix for issue 30
 # bundle not in path (edit init-script).
 # Add after ". /etc/rc.d/init.d/functions" (row 17).
-sed -i "17 a source /etc/profile.d/rvm.sh\nrvm use $RUBY_VERSION" /etc/init.d/gitlab
+#sed -i "17 a source /etc/profile.d/rvm.sh\nrvm use $RUBY_VERSION" /etc/init.d/gitlab
 
 ### Enable and start
 chkconfig gitlab on
@@ -194,7 +231,7 @@ setsebool -P httpd_can_network_connect 1
 ## Start
 service httpd start
 
-#  Configure iptables
+# Configure iptables
 
 ## Open port 80
 iptables -I INPUT -p tcp -m tcp --dport 80 -j ACCEPT
@@ -204,8 +241,8 @@ service iptables save
 
 echo "### Done ###############################################"
 echo "#"
-echo "# You have your MySQL root password in this file:"
-echo "# /home/git/gitlab/config/database.yml"
+echo "# You have your MySQL passwords in this file:"
+echo "# /home/git/mysql_passwords"
 echo "#"
 echo "# Point your browser to:"
 echo "# http://$GL_HOSTNAME (or: http://<host-ip>)"
